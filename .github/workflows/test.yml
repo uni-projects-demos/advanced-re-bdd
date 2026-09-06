@@ -1,0 +1,828 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - README.md
+
+permissions:
+  contents: write
+
+env:
+  headless: true
+  TZ: UTC
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout demo
+        uses: actions/checkout@v7
+
+      - name: Checkout project
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: project
+
+      # Setup latest supporting Java version
+      - name: Setup
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '16.0.2+7'
+          verify-signature: false
+
+      # Project outdated; update build.gradle.
+      - name: Update
+        working-directory: project
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path: Path = Path("build.gradle")
+          text: str = path.read_text()
+
+          text = text.replace(
+              "io.github.bonigarcia:webdrivermanager:3.8.1",
+              "io.github.bonigarcia:webdrivermanager:5.7.0",
+          )
+          text = text.replace(
+              "version: '4.1.4'",
+              "version: '4.18.1'"
+          )
+          if "'--plugin', 'json:target/cucumber.json'" not in text:
+              text = text.replace(
+                  "args = ['--plugin', 'pretty',",
+                  "args = ['--plugin', 'pretty',\n"
+                  "        '--plugin', 'json:target/cucumber.json',",
+              )
+
+          marker: str = "version '1.0-SNAPSHOT'"
+          if marker in text and "httpclient5.version" not in text:
+              text = text.replace(
+                  marker,
+                  marker + """
+
+                  ext['selenium.version'] = '4.18.1'
+                  ext['httpclient5.version'] = '5.2.1'
+                  ext['httpcore5.version'] = '5.2'
+                  """,
+              )
+
+          path.write_text(data=text)
+          PY
+
+      - name: Norm
+        working-directory: project
+        run: |
+          sed -i 's/\r$//' gradlew scripts/chrome.sh
+          chmod +x gradlew scripts/chrome.sh
+
+      # Fix legacy test bugs
+      - name: Fix
+        working-directory: project
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from typing import Callable
+          from pathlib import Path
+
+          PAGES: Path = Path("src/test/java/com/gallery/web/pages")
+          STEPS: Path = Path("src/test/java/com/gallery/web/stepdefs")
+
+          num_fix_patches: int = 0
+
+
+          def replace_many(file_path: Path, txt_replacements: list[tuple[str, str]]) -> None:
+              global num_fix_patches
+              if not file_path.exists():
+                  return
+
+              txt: str = file_path.read_text()
+              txt_orig: str = txt
+              num_replacements: int = 0
+
+              for old, new in txt_replacements:
+                  if old in txt:
+                      txt = txt.replace(old, new)
+                      num_replacements += 1
+
+              if txt != txt_orig:
+                  file_path.write_text(data=txt)
+                  num_fix_patches += num_replacements
+
+
+          def patch_group(file_path: Path, txt_transform: Callable[[str], str]) -> None:
+              global num_fix_patches
+              if not file_path.exists():
+                  return
+
+              txt_orig: str = file_path.read_text()
+              txt_updated: str = txt_transform(txt_orig)
+
+              if txt_updated != txt_orig:
+                  file_path.write_text(data=txt_updated)
+                  num_fix_patches += 1
+
+
+          SELENIUM_SUBMIT_REPLACEMENTS: dict[Path, list[tuple[str, str]]] = {
+              PAGES
+              / "BrowseArtworkPage.java": [
+                  ("gotoBtn.click();", "gotoBtn.submit();"),
+              ],
+              PAGES
+              / "ArtworkPage.java": [
+                  ("this.buyButton.click();", "this.buyButton.submit();"),
+                  ("this.bidButton.click();", "this.bidButton.submit();"),
+                  (
+                      "this.auctionBuyButton.click();",
+                      "this.auctionBuyButton.submit();",
+                  ),
+                  ("this.profileButton.click();", "this.profileButton.submit();"),
+                  (
+                      "this.calculateShippingCost.click();",
+                      "this.calculateShippingCost.submit();",
+                  ),
+              ],
+              PAGES
+              / "PaymentPage.java": [
+                  ("this.completePayment.click();", "this.completePayment.submit();"),
+                  ("this.cancelPayment.click();", "this.cancelPayment.submit();"),
+              ],
+              PAGES
+              / "CustomerProfilePage.java": [
+                  ("this.addCardButton.click();", "this.addCardButton.submit();"),
+              ],
+              PAGES
+              / "AdminEditPage.java": [
+                  ("doneBtn.click();", "doneBtn.submit();"),
+                  ("addBtn.click();", "addBtn.submit();"),
+              ],
+              PAGES
+              / "CustomerLoginPage.java": [
+                  ("this.submitBn.click();", "this.submitBn.submit();"),
+              ],
+              PAGES
+              / "CustomerChangePasswordPage.java": [
+                  (
+                      "this.confirmNewPasswordBtn.click();",
+                      "this.confirmNewPasswordBtn.submit();",
+                  ),
+              ],
+          }
+          for path, replacements in SELENIUM_SUBMIT_REPLACEMENTS.items():
+              replace_many(file_path=path, txt_replacements=replacements)
+
+
+          def patch_artwork_page(txt: str) -> str:
+              if "import org.openqa.selenium.JavascriptExecutor;" not in txt:
+                  txt = txt.replace(
+                      "import org.openqa.selenium.WebDriver;",
+                      "import org.openqa.selenium.JavascriptExecutor;\n"
+                      "import org.openqa.selenium.WebDriver;",
+                      1,
+                  )
+              if "private final WebDriver driver;" not in txt:
+                  txt = txt.replace(
+                      "public class ArtworkPage {\n",
+                      "public class ArtworkPage {\n    private final WebDriver driver;\n",
+                      1,
+                  )
+              if "this.driver = driver;" not in txt:
+                  txt = txt.replace(
+                      "PageFactory.initElements(driver, this);",
+                      "this.driver = driver;\n" "        PageFactory.initElements(driver, this);",
+                      1,
+                  )
+              return txt.replace(
+                  "this.newBidPrice.sendKeys(String.valueOf(bidAmount));",
+                   "((JavascriptExecutor) driver).executeScript(\n"
+                  '                "arguments[0].value = arguments[1];",\n'
+                  "                this.newBidPrice,\n"
+                  "                String.valueOf(bidAmount)\n"
+                  "        );",
+              )
+
+
+          patch_group(file_path=PAGES / "ArtworkPage.java", txt_transform=patch_artwork_page)
+
+
+          def patch_gallery_payment(txt: str) -> str:
+              if "import org.openqa.selenium.JavascriptExecutor;" not in txt:
+                  txt = txt.replace(
+                      "import org.openqa.selenium.WebDriver;",
+                      "import org.openqa.selenium.JavascriptExecutor;\n"
+                      "import org.openqa.selenium.WebDriver;",
+                      1,
+                  )
+              txt = txt.replace(
+                  '    @And("I visit an auction page")\n'
+                  "    public void i_visit_an_auction_page() {\n"
+                  "        customerProfilePage.clickBrowseArtwork();\n"
+                  "        browseArtworkPage.navigateToArtworkIndex(6);\n"
+                  "    }",
+                  '    @And("I visit an auction page")\n'
+                  "    public void i_visit_an_auction_page() {\n"
+                  '        driver.get("http://localhost:8080/browse_artwork");\n'
+                  "        browseArtworkPage.navigateToArtworkIndex(6);\n"
+                  "    }",
+                  1,
+              )
+              return txt.replace(
+                  '    @When("I add payment info with {string} {string} {string}")\n'
+                  "    public void i_add_payment_info_with_credit_card_expiry_cvc("
+                  "String creditCard, String expiry, String cvc) {\n"
+                  "        customerProfilePage.inputCreditCard(creditCard);\n"
+                  "        customerProfilePage.inputExpiry(expiry);\n"
+                  "        customerProfilePage.inputCvc(cvc);\n"
+                  "        customerProfilePage.clickAddPaymentInfo();\n"
+                  "    }",
+                  '    @When("I add payment info with {string} {string} {string}")\n'
+                  "    public void i_add_payment_info_with_credit_card_expiry_cvc("
+                  "String creditCard, String expiry, String cvc) {\n"
+                  "        ((JavascriptExecutor) driver).executeScript(\n"
+                  '                "document.getElementById(\\"cardNumber\\").value = arguments[0];" +\n'
+                  '                "document.getElementById(\\"expiry\\").value = arguments[1];" +\n'
+                  '                "document.getElementById(\\"cvc\\").value = arguments[2];",\n'
+                  "                creditCard, expiry, cvc\n"
+                  "        );\n"
+                  "        customerProfilePage.clickAddPaymentInfo();\n"
+                  "    }",
+                  1,
+              )
+
+
+          patch_group(
+              file_path=STEPS / "GalleryPaymentStepDefinitions.java", 
+              txt_transform=patch_gallery_payment
+          )
+
+
+          def patch_purchasing_winning_bid(txt: str) -> str:
+              old = (
+                  '    @Given("I visit an auction {string} page I have the winning bid for")\n'
+                  "    public void i_visit_an_auction_page_i_have_the_winning_bid_for("
+                  "String wonAuctionArtworkTitle) {\n"
+                  "        customerProfilePage.clickBrowseArtwork();\n"
+                  "        List<String> artworks = browseArtworkPage.getAllArtwork();\n"
+                  "        browseArtworkPage.navigateToArtworkIndex("
+                  "artworks.indexOf(wonAuctionArtworkTitle));\n"
+                  "    }"
+              )
+              new = (
+                  '    @Given("I visit an auction {string} page I have the winning bid for")\n'
+                  "    public void i_visit_an_auction_page_i_have_the_winning_bid_for("
+                  "String wonAuctionArtworkTitle) {\n"
+                  "        customerProfilePage.clickBrowseArtwork();\n"
+                  "        List<String> artworks = browseArtworkPage.getAllArtwork();\n"
+                  "        if (artworks.isEmpty()) {\n"
+                  '            driver.get("http://localhost:8080/browse_artwork");\n'
+                  "            artworks = browseArtworkPage.getAllArtwork();\n"
+                  "        }\n"
+                  "        browseArtworkPage.navigateToArtworkIndex("
+                  "artworks.indexOf(wonAuctionArtworkTitle));\n"
+                  "    }"
+              )
+              return txt.replace(old, new, 1)
+
+
+          patch_group(
+              file_path=STEPS / "PurchasingArtworkStepDefinitions.java",
+              txt_transform=patch_purchasing_winning_bid,
+          )
+
+
+          def patch_admin_editing(txt: str) -> str:
+              if "import org.openqa.selenium.By;" not in txt:
+                  txt = txt.replace(
+                      "import org.openqa.selenium.WebDriver;",
+                      "import org.openqa.selenium.By;\nimport org.openqa.selenium.WebDriver;",
+                      1,
+                  )
+              return txt.replace(
+                  '    @Then("I should be informed it has duplicate title")\n'
+                  "    public void i_should_be_informed_it_has_duplicate_title() {\n"
+                  "        assertNotNull(adminEditPage.getListErrorMessage());\n"
+                  "        assertTrue(adminEditPage\n"
+                  "                .getListErrorMessage()\n"
+                  "                .toLowerCase()\n"
+                  '                .contains("duplicate"));\n'
+                  "    }",
+                  '    @Then("I should be informed it has duplicate title")\n'
+                  "    public void i_should_be_informed_it_has_duplicate_title() {\n"
+                  "        String errorMessage = driver\n"
+                  '                .findElement(By.id("listErrorMessage"))\n'
+                  "                .getText();\n"
+                  "        assertNotNull(errorMessage);\n"
+                  "        assertTrue(errorMessage\n"
+                  "                .toLowerCase()\n"
+                  '                .contains("duplicate"));\n'
+                  "    }",
+                  1,
+              )
+
+
+          patch_group(
+              file_path=STEPS / "AdminEditingStepDefinitions.java",
+              txt_transform=patch_admin_editing,
+          )
+
+
+          def patch_admin_permission(txt: str) -> str:
+              if "import org.openqa.selenium.support.ui.WebDriverWait;" not in txt:
+                  txt = txt.replace(
+                      "import org.openqa.selenium.WebDriver;",
+                      "import java.time.Duration;\n\n"
+                      "import org.openqa.selenium.By;\n"
+                      "import org.openqa.selenium.StaleElementReferenceException;\n"
+                      "import org.openqa.selenium.WebDriver;\n"
+                      "import org.openqa.selenium.support.ui.WebDriverWait;",
+                      1,
+                  )
+              return txt.replace(
+                  '    @Then("I should get an error {string}")\n'
+                  "    public void i_should_get_an_error(String errorMsg) {\n"
+                  "        assertTrue(adminLoginPage.getErrorMessage().contains(errorMsg));\n"
+                  "    }",
+                  '    @Then("I should get an error {string}")\n'
+                  "    public void i_should_get_an_error(String errorMsg) {\n"
+                  "        boolean hasExpectedError = new WebDriverWait(\n"
+                  "                driver, Duration.ofSeconds(3)\n"
+                  "        )\n"
+                  "                .ignoring(StaleElementReferenceException.class)\n"
+                  "                .until(d -> d\n"
+                  '                        .findElement(By.id("errormsg"))\n'
+                  "                        .getText()\n"
+                  "                        .contains(errorMsg));\n"
+                  "        assertTrue(hasExpectedError);\n"
+                  "    }",
+                  1,
+              )
+
+
+          patch_group(
+              file_path=STEPS / "AdminPermissionStepDefinitions.java",
+              txt_transform=patch_admin_permission,
+          )
+
+
+          def patch_shipping(txt: str) -> str:
+              if "import org.openqa.selenium.JavascriptExecutor;" not in txt:
+                  txt = txt.replace(
+                      "import org.openqa.selenium.WebDriver;",
+                      "import org.openqa.selenium.JavascriptExecutor;\n"
+                      "import org.openqa.selenium.WebDriver;",
+                      1,
+                  )
+              return txt.replace(
+                  '    @And("I have entered my country {string}")\n'
+                  "    public void i_have_entered_my_country(String country) {\n"
+                  "        artworkPage.inputShippingCountry(country);\n"
+                  "    }",
+                  '    @And("I have entered my country {string}")\n'
+                  "    public void i_have_entered_my_country(String country) {\n"
+                  "        ((JavascriptExecutor) driver).executeScript(\n"
+                  '                "document.getElementById(\\"shippingCountryInput\\").value = arguments[0];",\n'
+                  "                country\n"
+                  "        );\n"
+                  "    }",
+                  1,
+              )
+
+
+          patch_group(
+              file_path=STEPS / "ShippingStepDefinitions.java", txt_transform=patch_shipping
+          )
+
+
+          for jsp in Path("src").rglob(pattern="*.jsp"):
+              replace_many(
+                  file_path=jsp,
+                  txt_replacements=[('action="/customer-profile"', 'action="/customer_profile"')],
+              )
+
+          print(f"{num_fix_patches} fix patches applied.")
+          PY
+
+      # Configure test dummy data for current use.
+      - name: Config
+        working-directory: project
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from re import Match, Pattern, compile, escape, subn
+          from datetime import date, timedelta
+          from pathlib import Path
+          
+          
+          def java_dt(d: date, hour: int, minute: int) -> str:
+              return f"LocalDateTime.of(" f"{d.year}, {d.month}, {d.day}, " f"{hour}, {minute})"
+          
+          
+          today: date = date.today()
+          two_days_ago: date = today - timedelta(days=2)
+          yesterday: date = today - timedelta(days=1)
+          tomorrow: date = today + timedelta(days=1)
+          day_after_tomorrow: date = today + timedelta(days=2)
+          
+          future_exp: str = f"12/{(today.year + 1) % 100:02d}"
+          expired_exp: str = f"01/{(today.year - 1) % 100:02d}"
+          
+          payment_feature: Path = Path("src/test/resources/features/galleryPayment.feature")
+          if payment_feature.exists():
+              txt: str = payment_feature.read_text()
+              txt = txt.replace('"11/11"', f'"{expired_exp}"')
+              for old_exp in (
+                  '"11/24"',
+                  '"11/23"',
+              ):
+                  txt = txt.replace(old_exp, f'"{future_exp}"')
+              payment_feature.write_text(data=txt)
+          
+          java_path: Path = Path("src/main/java/com/gallery/web/utils/FakeData.java")
+          if not java_path.exists():
+              raise RuntimeError(f"Could not find {java_path}")
+          java_txt: str = java_path.read_text()
+          
+          updates: list[tuple[str, str, str]] = [
+              (
+                  "AuctionNotStarted",
+                  java_dt(
+                      d=tomorrow,
+                      hour=9,
+                      minute=0,
+                  ),
+                  java_dt(
+                      d=day_after_tomorrow,
+                      hour=17,
+                      minute=0,
+                  ),
+              ),
+              (
+                  "AuctionClosed",
+                  java_dt(
+                      d=two_days_ago,
+                      hour=15,
+                      minute=30,
+                  ),
+                  java_dt(
+                      d=yesterday,
+                      hour=19,
+                      minute=30,
+                  ),
+              ),
+              (
+                  "AuctionWithoutBid",
+                  java_dt(
+                      d=yesterday,
+                      hour=9,
+                      minute=0,
+                  ),
+                  java_dt(
+                      d=tomorrow,
+                      hour=17,
+                      minute=0,
+                  ),
+              ),
+              (
+                  "AuctionWithBid",
+                  java_dt(
+                      d=yesterday,
+                      hour=9,
+                      minute=0,
+                  ),
+                  java_dt(
+                      d=tomorrow,
+                      hour=17,
+                      minute=0,
+                  ),
+              ),
+              (
+                  "AuctionWonForStartingPrice",
+                  java_dt(
+                      d=two_days_ago,
+                      hour=9,
+                      minute=0,
+                  ),
+                  java_dt(
+                      d=yesterday,
+                      hour=17,
+                      minute=0,
+                  ),
+              ),
+              (
+                  "AuctionWonForHighestBidPrice",
+                  java_dt(
+                      d=two_days_ago,
+                      hour=9,
+                      minute=0,
+                  ),
+                  java_dt(
+                      d=yesterday,
+                      hour=17,
+                      minute=0,
+                  ),
+              ),
+          ]
+          for name, start, close in updates:
+          
+              def repl(
+                  m_obj,
+                  s: str = start,
+                  c: str = close,
+              ) -> str:
+                  return f"{m_obj.group(1)}" f"{s}, {c}"
+          
+              pattern: str = (
+                  rf'("{escape(name)}"[\s\S]*?\n\s*)'
+                  rf"(LocalDateTime\.of\([^)]*\)),\s*"
+                  rf"(LocalDateTime\.of\([^)]*\))"
+              )
+              java_txt, count = subn(
+                  pattern=pattern,
+                  repl=repl,
+                  string=java_txt,
+                  count=1,
+              )
+              if count != 1:
+                  raise RuntimeError(f"Could not find and update {name}")
+          
+          bid_dates: dict[str, str] = {
+              "auction4": java_dt(
+                  d=yesterday,
+                  hour=10,
+                  minute=0,
+              ),
+              "auction5": java_dt(
+                  d=yesterday,
+                  hour=16,
+                  minute=59,
+              ),
+              "auction6": java_dt(
+                  d=yesterday,
+                  hour=16,
+                  minute=59,
+              ),
+          }
+          for variable_name, bid_time in bid_dates.items():
+              pattern: str = (
+                  rf"({escape(variable_name)}"
+                  rf"\.setWinningBid\(new Bid\("
+                  rf"[\s\S]*?\n\s*"
+                  rf"[0-9.]+,\s*)"
+                  rf"LocalDateTime\.of\([^)]*\)"
+                  rf"(,\s*{escape(variable_name)}\)\);)"
+              )
+              replacement: str = rf"\g<1>{bid_time}\g<2>"
+              java_txt, count = subn(
+                  pattern=pattern,
+                  repl=replacement,
+                  string=java_txt,
+                  count=1,
+              )
+              if count != 1:
+                  raise RuntimeError("Could not update winning-bid date for " f"{variable_name}")
+          
+          java_path.write_text(data=java_txt)
+          
+          artwork_feature: Path = Path("src/test/resources/features/seeingArtwork.feature")
+          if artwork_feature.exists():
+              lines: list[str] = artwork_feature.read_text().splitlines()
+              date_re: Pattern[str] = compile(pattern=r'"\d{2}-\d{2}-\d{4} ' r'\d{2}:\d{2}"')
+              expected_dates: dict[str, list[str]] = {
+                  "AuctionNotStarted": [
+                      tomorrow.strftime(format='"%d-%m-%Y 09:00"'),
+                      day_after_tomorrow.strftime(format='"%d-%m-%Y 17:00"'),
+                  ],
+                  "AuctionClosed": [
+                      two_days_ago.strftime(format='"%d-%m-%Y 15:30"'),
+                      yesterday.strftime(format='"%d-%m-%Y 19:30"'),
+                  ],
+              }
+              for auction_name, replacements in expected_dates.items():
+          
+                  is_found: bool = False
+          
+                  for i, line in enumerate[str](lines):
+                      if f'"{auction_name}"' not in line:
+                          continue
+          
+                      is_found = True
+          
+                      matches: list[Match[str]] = list(date_re.finditer(string=line))
+                      if len(matches) != len(replacements):
+                          raise RuntimeError(
+                              f"Expected "
+                              f"{len(replacements)} dates "
+                              f"for {auction_name}, "
+                              f"found {len(matches)}"
+                          )
+          
+                      replacement_iter = iter(replacements)
+                      lines[i] = date_re.sub(
+                          repl=lambda _: next(replacement_iter),
+                          string=line,
+                      )
+          
+                      break
+          
+                  if not is_found:
+                      raise RuntimeError(
+                          f"Could not find " f"{auction_name} in " "seeingArtwork.feature"
+                      )
+          
+              artwork_feature.write_text(data="\n".join(lines) + "\n")
+          PY
+
+      - name: Install
+        working-directory: project
+        run: ./scripts/chrome.sh
+
+      - name: Test
+        id: tests
+        working-directory: project
+        shell: bash
+        run: |
+          set +e
+          ./gradlew test cucumber --no-daemon 2>&1 | tee ../cucumber.log
+          TEST_EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$TEST_EXIT" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Summary
+        shell: bash
+        env:
+          TEST_EXIT: ${{ steps.tests.outputs.exit_code }}
+        run: |
+          python3 <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          from json import loads
+          from os import environ
+          from re import sub
+          
+          SKIP_STATUSES: set[str] = {
+              "undefined",
+              "pending",
+              "ambiguous",
+              "skipped",
+          }
+          
+          scenario_results: list[dict[str, str | list[dict[str, str]]]] = []
+          report_path: Path = Path("project/target/cucumber.json")
+          
+          if report_path.exists():
+              features: dict = loads(s=report_path.read_text(errors="replace"))
+              for feature in features:
+                  feature_name: str = feature.get("name", "Unnamed feature")
+          
+                  for scenario in feature.get("elements", []):
+                      if scenario.get("type") == "background":
+                          continue
+          
+                      statuses: set[str] = {
+                          step.get("result", {}).get("status", "").lower()
+                          for section in (
+                              "before",
+                              "steps",
+                              "after",
+                          )
+                          for step in scenario.get(section, [])
+                      } - {""}
+          
+                      if "failed" in statuses:
+                          scenario_status: str = "FAIL"
+                      elif statuses & SKIP_STATUSES:
+                          scenario_status = "SKIP"
+                      else:
+                          scenario_status = "PASS"
+          
+                      scenario_steps: list[dict[str, str]] = [
+                          {
+                              "keyword": step.get("keyword", "").strip(),
+                              "text": step.get("name", ""),
+                          }
+                          for step in scenario.get("steps", [])
+                      ]
+          
+                      scenario_results.append(
+                          {
+                              "feature": feature_name,
+                              "scenario": scenario.get("name", "Unnamed scenario"),
+                              "status": scenario_status,
+                              "steps": scenario_steps,
+                          }
+                      )
+          
+          status_counts: Counter[str | list[dict[str, str]]] = Counter(
+              r["status"] for r in scenario_results
+          )
+          
+          num_passed: int = status_counts["PASS"]
+          num_failed: int = status_counts["FAIL"]
+          num_skipped: int = status_counts["SKIP"]
+          num_ttl: int = len(scenario_results)
+          
+          log_path: Path = Path("cucumber.log")
+          log: str = ""
+          if log_path.exists():
+              log = sub(
+                  pattern=r"\x1b\[[0-9;]*m",
+                  repl="",
+                  string=log_path.read_text(errors="replace"),
+              )
+          
+          status: str = "Success" if environ.get("TEST_EXIT") == "0" else "Fail"
+          
+          result_lines = []
+          current_feature = None
+          for res in scenario_results:
+              if res["feature"] != current_feature:
+                  current_feature = res["feature"]
+          
+                  if result_lines:
+                      result_lines.append("")
+          
+                  result_lines.extend(
+                      [
+                          f"Feature: {current_feature}",
+                          "-" * len(current_feature),
+                          "",
+                      ]
+                  )
+          
+              result_lines.append(f"Scenario: [{res['status']}] {res['scenario']}\n")
+          
+              for step in res["steps"]:
+                  result_lines.append(f"  {step['keyword']} " f"{step['text']}")
+          
+              result_lines.append("")
+          
+          results_block: str = "\n".join(result_lines)
+          
+          readme_content: str = f"""
+          # Advanced Requirements Engineering BDD Demo
+          
+          RE BDD acceptance-test scenario results for seamless E-commerce art gallery web app using Spring Boot.
+
+          Cucumber test results are generated from a workflow run on an advanced University of Auckland project.
+
+          Advanced Requirements Engineering project, Group 1 members:
+          * Fuki Babasaki
+          * James Coppard
+          * Adam Ross
+          * Berverley Sun 
+          * Valerio Terragni
+
+          > Note: course/project is completed before ChatGPT and other Gen-AI models have been publicly available.
+
+          ## Test Results
+          
+          | Scenario Status | Count |
+          |---|---:|
+          | Passed | {num_passed} |
+          | Failed | {num_failed} |
+          | Skipped | {num_skipped} |
+          
+          ```gherkin
+          {results_block}
+          ```
+          """
+          
+          readme_path: Path = Path("README.md")
+          readme_path.write_text(data=readme_content)
+          PY
+
+      - name: Commit
+        shell: bash
+        run: |
+          git config user.name "Adam Ross [workflow]"
+          git config user.email "14985050+r055a@users.noreply.github.com"
+
+          git add README.md
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Add README.md"
+            git push
+          fi
+
+      - name: Status
+        if: always()
+        shell: bash
+        env:
+          TEST_EXIT: ${{ steps.tests.outputs.exit_code }}
+        run: |
+          if [ "$TEST_EXIT" != "0" ]; then
+            echo "Fail"
+            exit "$TEST_EXIT"
+          fi
+
+          echo "Pass"
