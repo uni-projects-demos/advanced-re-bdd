@@ -9,7 +9,7 @@ Advanced Requirements Engineering project, Group 1 members:
 * Fuki Babasaki
 * James Coppard
 * Adam Ross
-* Berverley Sun 
+* Beverley Sun 
 * Valerio Terragni
 
 > Note: course/project is completed before ChatGPT and other Gen-AI models have been publicly available.
